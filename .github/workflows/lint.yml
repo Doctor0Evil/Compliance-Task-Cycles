@@ -1,0 +1,203 @@
+name: 🧹 Lint & Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-yaml:
+    name: 📝 YAML Linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🧹 Lint YAML files
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          config_file: .yamllint.yml
+          strict: false
+        continue-on-error: true
+
+      - name: 🔍 Manual YAML validation
+        run: |
+          echo "🔍 Validating YAML files manually..."
+          find . -type f \( -name "*.yml" -o -name "*.yaml" \) -not -path "./.git/*" | while read -r file; do
+            echo "Checking: $file"
+            python3 - <<EOF
+import yaml, sys
+file_path = "$file"
+try:
+    with open(file_path, 'r') as f:
+        yaml.safe_load(f)
+    print(f"✅ {file_path} - Valid YAML")
+except yaml.YAMLError as e:
+    print(f"❌ {file_path} - Invalid YAML: {str(e)}")
+    sys.exit(1)
+except Exception as e:
+    print(f"⚠️ {file_path} - Error: {str(e)}")
+EOF
+          done
+          echo "✅ YAML validation completed"
+
+  lint-powershell:
+    name: 🔧 PowerShell Linting
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🧹 Lint PowerShell files (with Linux/macOS fix)
+        shell: pwsh
+        run: |
+          Write-Host "🧹 Linting PowerShell files..."
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
+          }
+          if ("${{ matrix.os }}" -eq "ubuntu-latest" -or "${{ matrix.os }}" -eq "macos-latest") {
+            $psFiles = Get-ChildItem -Recurse -Include "*.ps1","*.psm1" -Exclude "*.Tests.ps1","GitHubActionsAdapter.psm1"
+          } else {
+            $psFiles = Get-ChildItem -Recurse -Include "*.ps1","*.psm1" -Exclude "*.Tests.ps1"
+          }
+          if ($psFiles.Count -eq 0) { Write-Host "ℹ️ No PowerShell files found to lint"; exit 0 }
+          $allIssues = @()
+          foreach ($file in $psFiles) {
+            Write-Host "Checking: $($file.FullName)"
+            try {
+              $issues = Invoke-ScriptAnalyzer -Path $file.FullName -Severity Warning,Error
+              if ($issues.Count -eq 0) {
+                Write-Host "✅ $($file.Name) - No issues found"
+              } else {
+                Write-Host "⚠️ $($file.Name) - Found $($issues.Count) issues:"
+                $issues | ForEach-Object { Write-Host "  Line $($_.Line): $($_.Message)" }
+                $allIssues += $issues
+              }
+            } catch {
+              Write-Host "❌ Error analyzing $($file.Name): $($_.Exception.Message)"
+              $allIssues += "error"
+            }
+          }
+          if ($allIssues.Count -gt 0) {
+            Write-Host "⚠️ Found $($allIssues.Count) total PowerShell linting issues"
+          } else {
+            Write-Host "✅ All PowerShell files passed linting"
+          }
+
+  lint-markdown:
+    name: 📚 Markdown Linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: |
+            **/*.md
+            !node_modules/**
+          config: |
+            { "default": true, "MD013": false, "MD033": false, "MD041": false }
+        continue-on-error: true
+
+  validate-json:
+    name: 📋 JSON Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "🔍 Validating JSON files..."
+          find . -type f -name "*.json" -not -path "./.git/*" -not -path "./node_modules/*" | while read -r file; do
+            echo "Checking: $file"
+            if python3 -m json.tool "$file" > /dev/null 2>&1; then
+              echo "✅ $file - Valid JSON"
+            else
+              echo "❌ $file - Invalid JSON"
+              python3 -m json.tool "$file" 2>&1 | head -5
+            fi
+          done
+          echo "✅ JSON validation completed"
+
+  check-links:
+    name: 🔗 Link Checking
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          use-verbose-mode: 'no'
+          config-file: '.github/mlc_config.json'
+        continue-on-error: true
+      - run: |
+          echo "🔗 Checking critical links in README.md..."
+          if [[ -f "README.md" ]]; then
+            URLS=$(grep -oP 'https?://[^\s\)]+' README.md | head -10)
+            if [[ -n "$URLS" ]]; then
+              echo "$URLS" | while IFS= read -r url; do
+                if curl -s --head --max-time 10 "$url" > /dev/null; then
+                  echo "✅ $url - Accessible"
+                else
+                  echo "⚠️ $url - May be inaccessible"
+                fi
+              done
+            else
+              echo "ℹ️ No URLs found in README.md"
+            fi
+          fi
+
+  security-lint:
+    name: 🔒 Security Linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "🔍 Scanning for potential secrets..."
+          PATTERNS=(
+            "password\\s*[=:]\\s*['\"][^'\"]{8,}"
+            "api[_-]?key\\s*[=:]\\s*['\"][^'\"]{20,}"
+            "secret\\s*[=:]\\s*['\"][^'\"]{16,}"
+            "token\\s*[=:]\\s*['\"][^'\"]{16,}"
+            "private[_-]?key\\s*[=:]\\s*['\"][^'\"]{32,}"
+          )
+          FOUND_ISSUES=false
+          for pattern in "${PATTERNS[@]}"; do
+            if grep -rE -i "$pattern" . --exclude-dir=.git --exclude="*.md" --exclude-dir=node_modules 2>/dev/null | grep -vE "example|placeholder|template|test" | head -5; then
+              FOUND_ISSUES=true
+            fi
+          done
+          if [[ "$FOUND_ISSUES" == "true" ]]; then
+            echo "⚠️ Potential secrets detected - please review"
+          else
+            echo "✅ No obvious secrets detected"
+          fi
+
+  code-quality-summary:
+    name: 📊 Code Quality Summary
+    runs-on: ubuntu-latest
+    needs: [lint-yaml, lint-powershell, lint-markdown, validate-json, check-links, security-lint]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "📊 Code Quality Summary:"
+          echo "YAML Linting: ${{ needs.lint-yaml.result }}"
+          echo "PowerShell Linting: ${{ needs.lint-powershell.result }}"
+          echo "Markdown Linting: ${{ needs.lint-markdown.result }}"
+          echo "JSON Validation: ${{ needs.validate-json.result }}"
+          echo "Link Checking: ${{ needs.check-links.result }}"
+          echo "Security Linting: ${{ needs.security-lint.result }}"

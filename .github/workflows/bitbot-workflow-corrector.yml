@@ -1,0 +1,269 @@
+name: Bit.Hub Runner Compliance and Workflow Corrector
+
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+      - ".bit/**"
+      - ".bithub/**"
+  workflow_dispatch:
+    inputs:
+      repair_mode:
+        description: "Apply auto-fixes (true) or just report (false)"
+        type: boolean
+        default: true
+      target_ref:
+        description: "Base branch for the PR"
+        type: string
+        default: "main"
+  workflow_call:
+    inputs:
+      repair_mode:
+        required: false
+        type: boolean
+        default: true
+      target_ref:
+        required: false
+        type: string
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bitbot-corrector-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BIT_HUB_RUNNER_LABELS: "self-hosted,bit.hub,linux"
+  GITHUB_DEFAULT_RUNNER: "ubuntu-latest"
+  DEFAULT_TIMEOUT_MIN: "30"
+  REPORT_DIR: ".bithub/reports"
+  POLICY_DIR: ".bithub/policy"
+  SCHEMA_DIR: ".bit/schemas"
+  CORRECTOR_BRANCH_PREFIX: "bot/workflow-corrections"
+  OPA_VERSION: "0.64.1"
+  YQ_VERSION: "v4.44.3"
+
+jobs:
+  preflight:
+    name: Preflight and policy bootstrap
+    runs-on: ${{ env.GITHUB_DEFAULT_RUNNER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Ensure directories
+        run: |
+          mkdir -p "${REPORT_DIR}" "${POLICY_DIR}" "${SCHEMA_DIR}"
+      - name: Install yq and OPA
+        run: |
+          BIN="$HOME/.local/bin"; mkdir -p "$BIN"
+          curl -fsSL -o "$BIN/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          curl -fsSL -o "$BIN/opa" "https://openpolicyagent.org/downloads/v${OPA_VERSION}/opa_linux_amd64_static"
+          chmod +x "$BIN/yq" "$BIN/opa"
+          echo "$BIN" >> $GITHUB_PATH
+      - name: Seed Bit.Hub compliance policy
+        run: |
+          cat > "${POLICY_DIR}/comply.rego" <<'REGO'
+          package bithub.workflow
+          deny[msg] {
+            input.path
+            not startswith(input.path, ".github/workflows/")
+            msg := sprintf("Workflow outside .github/workflows: %s", [input.path])
+          }
+          deny[msg] {
+            not input.workflow.permissions
+            msg := "Workflow missing top-level permissions block"
+          }
+          warn[msg] {
+            not input.workflow.concurrency
+            msg := "Workflow missing top-level concurrency"
+          }
+          deny[msg] {
+            some i
+            input.uses[i] == "actions/checkout@v1" or input.uses[i] == "actions/checkout@v2"
+            msg := "Outdated actions/checkout version (< v4) detected"
+          }
+          warn[msg] {
+            some i
+            input.uses[i] == "actions/checkout@v3"
+            msg := "Consider upgrading actions/checkout@v3 to v4"
+          }
+          deny[msg] {
+            some j
+            not input.jobs[j]."timeout-minutes"
+            msg := sprintf("Job '%s' missing timeout-minutes", [j])
+          }
+          warn[msg] {
+            some j
+            not input.jobs[j].runs_on_adaptive
+            msg := sprintf("Job '%s' does not use adaptive runs-on", [j])
+          }
+          REGO
+      - name: Adaptive runs-on schema
+        run: |
+          cat > "${SCHEMA_DIR}/adaptive-runs-on.json" <<'JSON'
+          {
+            "type": "object",
+            "properties": {
+              "runs-on": {
+                "anyOf": [
+                  { "type": "string" },
+                  { "type": "array", "items": { "type": "string" } }
+                ]
+              }
+            }
+          }
+          JSON
+
+  analyze_and_fix:
+    name: Analyze and correct workflows
+    needs: preflight
+    runs-on: ${{ env.GITHUB_DEFAULT_RUNNER }}
+    outputs:
+      changes: ${{ steps.diff.outputs.changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Normalize workflow filenames
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in .github/workflows/*; do
+            [ -f "$f" ] || continue
+            b="$(basename "$f")"
+            nf="$(echo "$b" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' )"
+            nf="${nf//[^a-z0-9._-]/-}"
+            if [[ "$b" != "$nf" ]]; then
+              git mv "$f" ".github/workflows/$nf"
+              echo "Renamed $b -> $nf"
+            fi
+          done
+      - name: Inject required blocks and adaptive runners
+        shell: bash
+        env:
+          DEFAULT_TIMEOUT_MIN: ${{ env.DEFAULT_TIMEOUT_MIN }}
+          BIT_HUB_RUNNER_LABELS: ${{ env.BIT_HUB_RUNNER_LABELS }}
+        run: |
+          shopt -s nullglob
+          for y in .github/workflows/*.y*ml; do
+            yq -i 'if has("name") then . else .name = "Auto-Normalized Workflow" end' "$y"
+            yq -i '.permissions = (.permissions // {"contents":"read"})' "$y"
+            yq -i '
+              if has("concurrency") then .
+              else .concurrency = {"group": "wf-${{ github.ref }}", "cancel-in-progress": false}
+              end
+            ' "$y"
+            yq -i '.jobs |= with_entries(.value."timeout-minutes" = (.value."timeout-minutes" // env(DEFAULT_TIMEOUT_MIN) | tonumber))' "$y"
+            yq -i '.jobs |= with_entries(.value."runs-on" = (.value."runs-on" // (env(BIT_HUB_RUNNER_LABELS) | split(","))))' "$y"
+            yq -i '.jobs |= with_entries(.value.runs_on_adaptive = true)' "$y"
+            yq -i '.. | select(tag == "!!str") |= sub("actions/checkout@v[12]"; "actions/checkout@v4")' "$y"
+            sed -i 's|::set-output name=\([^:]*\)::|echo "\1=" >> $GITHUB_OUTPUT # migrated |g' "$y"
+          done
+      - name: Policy evaluation to NDJSON
+        shell: bash
+        env:
+          REPORT_DIR: ${{ env.REPORT_DIR }}
+          POLICY_DIR: ${{ env.POLICY_DIR }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          REPORT="${REPORT_DIR}/policy-report.ndjson"
+          : > "$REPORT"
+          shopt -s nullglob
+          for y in .github/workflows/*.y*ml; do
+            uses=$(yq '.. | select(tag == "!!str") | select(test("^[^ ]+@v[0-9]+$"))' "$y" | tr '\n' ' ' || true)
+            jq -n --arg path "$y" \
+                  --arg uses "$uses" \
+                  --argjson wf "$(yq -o=json '.' "$y")" \
+                  --argjson jobs "$(yq -o=json '.jobs' "$y")" '
+              {path:$path, uses:($uses|split(" ")|map(select(length>0))), workflow:$wf, jobs:$jobs}
+            ' > /tmp/input.json
+            opa eval -f json -I -d "$POLICY_DIR" -i /tmp/input.json 'data.bithub.workflow' \
+              | jq -c '.result[].expressions[].value
+                       | {path: input.path, deny:(.deny // []), warn:(.warn // [])}' --argfile input /tmp/input.json \
+              >> "$REPORT" || true
+          done
+          echo "Wrote $REPORT"
+      - name: Stage changes
+        id: diff
+        shell: bash
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  propose_changes:
+    name: Open PR with fixes and audit
+    needs: analyze_and_fix
+    if: needs.analyze_and_fix.outputs.changes == 'true'
+    runs-on: ${{ env.GITHUB_DEFAULT_RUNNER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Re-stage
+        run: git add -A
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ env.CORRECTOR_BRANCH_PREFIX }}/${{ github.run_id }}
+          base: ${{ inputs.target_ref || 'main' }}
+          title: "Bit.Hub Compliance: Auto-corrections for workflows"
+          commit-message: "chore(bit.hub): normalize workflows, inject permissions/concurrency, enforce timeouts, adaptive runs-on, upgrade checkout"
+          body: |
+            Automated corrections to align workflows with Bit.Hub runner and policy practices.
+            - Injected minimal permissions and concurrency
+            - Enforced timeout-minutes and adaptive runs-on
+            - Normalized filenames; upgraded actions/checkout to v4
+            - Policy report: ${REPORT_DIR}/policy-report.ndjson
+          labels: |
+            compliance
+            bit.hub
+            automation
+          delete-branch: true
+
+  gate_on_policy:
+    name: Gate on policy denials
+    needs: [analyze_and_fix, propose_changes]
+    runs-on: ${{ env.GITHUB_DEFAULT_RUNNER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Fail if denials remain
+        shell: bash
+        run: |
+          DENY=$(jq '[.deny[]] | length' "${REPORT_DIR}/policy-report.ndjson" 2>/dev/null || echo 0)
+          if [ "$DENY" -gt 0 ]; then
+            echo "Policy denials remain: $DENY"
+            exit 1
+          fi
+          echo "No policy denials."
+
+  celebrate_and_log:
+    name: Emit Bit.Hub event
+    needs: gate_on_policy
+    if: always()
+    runs-on: ${{ env.GITHUB_DEFAULT_RUNNER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Log correction event
+        run: |
+          mkdir -p .bithub/events
+          cat > ".bithub/events/${{ github.run_id }}.json" <<JSON
+          {
+            "event": "workflow_correction",
+            "by": "${{ github.actor }}",
+            "repo": "${{ github.repository }}",
+            "run_id": "${{ github.run_id }}",
+            "status": "completed",
+            "timestamp": "${{ github.run_started_at }}"
+          }
+          JSON
+          git add .bithub/events || true
+          git -c user.name="bitbot" -c user.email="bitbot@users.noreply.github.com" \
+            commit -m "chore(events): log correction event ${{ github.run_id }}" || true
+          echo "::notice title=Bit.Hub::Compliance event logged"

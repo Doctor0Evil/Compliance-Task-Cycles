@@ -1,0 +1,153 @@
+name: Meta Orchestrator with Livingroom Runner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: orchestrator-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight-fix:
+    name: Preflight Fix (Ubuntu)
+    uses: ./.github/workflows/workflow_fixer.yml
+    with:
+      caller: orchestrator
+      depth: 2
+      bot_name: "github-actions[bot]"
+      bot_email: "41898282+github-actions[bot]@users.noreply.github.com"
+
+  generator:
+    name: Workflow Generator (Ubuntu)
+    needs: preflight-fix
+    uses: ./.github/workflows/workflow_generator.yml
+    with:
+      create_samples: true
+      bot_name: "actions-user"
+      bot_email: "actions-user@users.noreply.github.com"
+
+  validator:
+    name: Workflow Validator (Ubuntu)
+    needs: [preflight-fix, generator]
+    uses: ./.github/workflows/workflow_validator.yml
+    with:
+      caller: orchestrator-validator
+      bot_name: "github-actions[bot]"
+      bot_email: "41898282+github-actions[bot]@users.noreply.github.com"
+
+  linux-integration:
+    name: ALN · Lisp · Bit.Hub Integration Checks
+    needs: validator
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Python (for ALN/Bit.Hub native)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Ensure SBCL (Lisp) and CLI Integration
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y sbcl clisp python3-pip
+          sbcl --version || echo "SBCL not installed!"
+          clisp --version || echo "CLISP not installed!"
+        
+      - name: Integration: Check ALN Syntax, Bit.Hub Health, and Lisp Modules
+        run: |
+          if [ -f scripts/aln-lint.py ]; then
+            echo "Linting ALN sources..."
+            python scripts/aln-lint.py ./aln/
+          else
+            echo "ALN linter not found, skipping."
+          fi
+          if [ -f scripts/bithub-health.py ]; then
+            python scripts/bithub-health.py
+          else
+            echo "Bit.Hub health script missing."
+          fi
+          if [ -f scripts/lisp-integration.lisp ]; then
+            sbcl --non-interactive --load scripts/lisp-integration.lisp || true
+          else
+            echo "Lisp integration script not found."
+          fi
+
+      - name: Sync Bit.Hub Artifacts
+        run: |
+          if [ -d .bit/artifacts ]; then
+            echo "Syncing Bit.Hub artifacts..."
+            ls .bit/artifacts
+          else
+            echo "No Bit.Hub artifacts found."
+          fi
+
+  windows-tests:
+    name: Livingroom Runner Tasks (Self‑hosted Windows)
+    needs: linux-integration
+    runs-on: [self-hosted, Windows, X64]
+    if: success()
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Confirm Runner Context
+        shell: pwsh
+        run: |
+          Write-Host "Runner Name: $env:RUNNER_NAME"
+          Write-Host "Runner OS: $env:RUNNER_OS $env:RUNNER_ARCH"
+          Write-Host "Running on Livingroom self-hosted Windows runner."
+
+      - name: Ensure aln-analyze on Windows
+        shell: pwsh
+        run: |
+          if (Get-Command aln-analyze -ErrorAction SilentlyContinue) {
+            Write-Host "aln-analyze already available"
+          } else {
+            Write-Host "Installing aln-analyze..."
+            try {
+              pip install --upgrade pip
+              pip install aln-analyze
+            } catch {
+              Write-Warning "Unable to install via pip — please ensure a Windows binary is available."
+            }
+          }
+
+      - name: Run aln-analyze (safe mode on Windows)
+        shell: pwsh
+        run: |
+          if (Get-Command aln-analyze -ErrorAction SilentlyContinue) {
+            aln-analyze --input "$env:GITHUB_WORKSPACE\logs" --output "C:\temp\failure.lst" --profane-allow 'fuck,shit,bitch,asshole,cunt'
+          } else {
+            Write-Warning "aln-analyze not found — skipping."
+          }
+
+      - name: Build or Test on Windows
+        shell: pwsh
+        run: |
+          if (Test-Path .\scripts\windows_build.ps1) {
+            pwsh .\scripts\windows_build.ps1
+          } else {
+            Write-Host "No Windows build script found — skipping."
+
+  recovery:
+    name: Recovery Path (Ubuntu)
+    needs: [linux-integration, windows-tests]
+    if: failure()
+    uses: ./.github/workflows/workflow_fixer.yml
+    with:
+      caller: orchestrator-recovery
+      depth: 1
+      bot_name: "github-actions[bot]"
+      bot_email: "41898282+github-actions[bot]@users.noreply.github.com"

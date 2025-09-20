@@ -1,0 +1,95 @@
+name: Preflight Namespace & Workflow Auto‑Fix
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  preflight-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Normalize .gitattributes
+        run: |
+          if [ -f .gitattributes ]; then
+            echo "🔍 Checking .gitattributes for bad attr names..."
+            # Force any comment line to start with '#', strip stray whitespace
+            sed -i 's/^[[:space:]]*#/#/' .gitattributes
+            echo "✅ Normalized .gitattributes"
+          else
+            echo "::notice::.gitattributes not found — skipping"
+          fi
+
+      - name: Detect and stage changes
+        run: |
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "📌 Staging all modifications..."
+            git add -A
+          else
+            echo "✅ No changes to stage"
+          fi
+
+      - name: Auto‑resolve safe workflow conflicts
+        run: |
+          conflict_files=$(grep -lR "<<<<<<<" .github/workflows || true)
+          if [ -n "$conflict_files" ]; then
+            echo "⚠ Found conflict markers in:"
+            echo "$conflict_files"
+            for f in $conflict_files; do
+              echo "    → Resolving $f with --ours"
+              git checkout --ours "$f"
+              git add "$f"
+            done
+          else
+            echo "✅ No workflow conflicts detected"
+          fi
+
+      - name: Commit changes if any
+        run: |
+          if ! git diff --cached --quiet; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "ci(preflight): normalize .gitattributes, resolve workflow conflicts"
+          else
+            echo "✅ Nothing to commit"
+          fi
+
+      - name: Attempt push
+        id: push_attempt
+        continue-on-error: true
+        run: |
+          set -e
+          if git rev-parse --verify main >/dev/null 2>&1; then
+            git pull --rebase origin main
+          fi
+          git push origin HEAD:main
+
+      - name: Fallback to PR if push blocked
+        if: steps.push_attempt.outcome == 'failure'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "ci(preflight): normalize .gitattributes, resolve workflow conflicts"
+          branch: preflight/autofix-${{ github.run_id }}
+          title: "Preflight Autofix – run ${{ github.run_id }}"
+          body: |
+            Automated fixes from Preflight Namespace & Workflow Auto‑Fix:
+            - Normalized `.gitattributes`
+            - Resolved safe workflow conflicts
+            Triggered by ${{ github.workflow }} on ${{ github.ref_name }}
+          delete-branch: true
+
+      - name: Report post‑fix status
+        run: |
+          echo "Post‑fix HEAD: $(git rev-parse HEAD)"
+          echo "Branch: $(git branch --show-current)"
